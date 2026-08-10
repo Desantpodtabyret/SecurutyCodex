@@ -74,7 +74,7 @@ public class GhostEngine
     };
 
     static string markerFolder = @"C:\Windows\Global\cook";
-    static int waitTimeoutMs = 45000;
+    static int waitTimeoutMs = 20000;
     static int checkIntervalMs = 2000;
 
     public static bool Inject(byte[] shellcode, ref string log)
